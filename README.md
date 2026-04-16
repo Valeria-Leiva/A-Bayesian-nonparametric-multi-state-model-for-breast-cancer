@@ -1,1 +1,1 @@
-# A-Bayesian-nonparametric-multi-state-model-for-breast-cancer
+# This repository contains the R scripts and computational routines for the implementation of a Bayesian Nonparametric Multi-State Model for Breast Cancer. The code covers data preprocessing, model estimation, and the analysis of transitions between clinical states.
