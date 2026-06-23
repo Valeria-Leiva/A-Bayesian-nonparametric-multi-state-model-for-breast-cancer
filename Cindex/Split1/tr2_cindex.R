@@ -3,7 +3,7 @@
 
 
 # set directory worj ------------------------------------------------------
-setwd("/home/vjleiva/BNP_Multistate/TrainTest/Split1")
+setwd("..../Split1")
 
 
 # functions ---------------------------------------------------------------
