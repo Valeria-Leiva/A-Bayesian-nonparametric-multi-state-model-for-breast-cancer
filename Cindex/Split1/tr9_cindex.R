@@ -1,8 +1,8 @@
-# Cindex - transition 6
+# Cindex - transition 9
 # rm(list = ls())
 
 
-# set directory worj ------------------------------------------------------
+# set directory work ------------------------------------------------------
 setwd(".../Split1")
 
 
