@@ -5,7 +5,7 @@
 
 
 # set working directory ---------------------------------------------------
-setwd("/home/vjleiva/BNP_Multistate/TrainTest/Split1")
+setwd("...../Split1")
 
 
 # libraries ---------------------------------------------------------------
@@ -20,7 +20,7 @@ library("stats")
 options("max.print"=1000000)
 mem.maxVSize(32000000000)
 
-load("Res_bsSizeLNO_BNP_1_zellnerTrain.RData")
+load("Res_bsSizeLNO_BNP_25_zellnerTrain.RData")
 betah2 <- out.DDP2$BUGSoutput$sims.list$betah
 # dim(betah2) #Nmc p Tr Hdp
 bk2 <- out.DDP2$BUGSoutput$sims.list$bk
