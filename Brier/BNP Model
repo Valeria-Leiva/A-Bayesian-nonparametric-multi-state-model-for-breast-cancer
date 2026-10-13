@@ -1,1 +1,181 @@
+# ==============================================================================
+# BAYESIAN MULTI-STATE MODEL EVALUATION: IPCW BRIER SCORE AT 5 & 10 YEARS
+# METABRIC Cohort Analysis (Bayesian Nonparametric BNP & Parametric BP)
+# ==============================================================================
+# Note:
+# 1. This run uses the Bayesian Nonparametric (BNP) model with H = 25 components.
+# 2. The function `calc_pred_cdf()` automatically handles both BNP (H = 25) 
+#    and standard Bayesian Parametric (BP) models (when H = 1).
+# 3. Update paths to evaluate different folds/splits (e.g., Split1, Split2, etc.).
+# ==============================================================================
 
+# Clear workspace
+rm(list = ls())
+
+# Required Libraries -----------------------------------------------------------
+library(survminer)
+library(tidyverse)
+library(splines)
+library(survival)
+
+# 1. Load Data and MCMC Model Output -------------------------------------------
+# Note: Update file path according to local environment or split fold
+load("Split1/Res_bsSizeLNO_BNP_25_zellnerTrain.RData")
+load("Split1/id_res_up.RData")
+load("Split1/resp_up_II.RData")
+
+# Extract MCMC output dimensions
+betah2 <- out.DDP2\$BUGSoutput$sims.list$betah    # [Nmc, p, tra, Hdp]
+bk2    <- out.DDP2\$BUGSoutput$sims.list$bk       # [Nmc, n_hosp]
+wh2    <- out.DDP2\$BUGSoutput$sims.list$BetaProb # [Nmc, Hdp, tra]
+sig2   <- out.DDP2\$BUGSoutput$sims.list$sigma2   # [Nmc, tra]
+
+Nmc <- dim(betah2)[1]
+p   <- dim(betah2)[2]
+tra <- dim(betah2)[3]
+Hdp <- dim(betah2)[4] # Hdp = 25 for BNP; Hdp = 1 for BP
+
+# 2. Process Test Dataset ------------------------------------------------------
+col_er <- grep("^ER", colnames(res), ignore.case = TRUE, value = TRUE)[1]
+
+res2 <- res %>%
+  mutate(
+    time = Tstop - Tstart,
+    trans2 = case_when(
+      trans == 10 ~ 1, trans == 11 ~ 2, trans == 12 ~ 3,
+      trans == 13 ~ 4, trans == 14 ~ 5, trans == 15 ~ 6,
+      trans == 16 ~ 7, trans == 17 ~ 8, trans == 18 ~ 9,
+      TRUE ~ as.numeric(as.character(trans))
+    ),
+    ER.status = ifelse(.data[[col_er]] == "ER+" | .data[[col_er]] == 1, 1, 0)
+  )
+
+cols_req <- c("id", "AGE", "LN_O", "Size", "Grade", "ER.status", 
+              "hospital", "trans2", "time", "status")
+
+res2.na <- na.omit(res2[, cols_req])
+res2.na.test <- res2.na %>% filter(id %in% id_res_up\$id.test)
+
+# 3. Vectorised Predicted CDF Calculation (Supports BNP H = 25 and BP H = 1) ---
+calc_pred_cdf <- function(y_eval, X_mat, tr_select, hp_vec) {
+  n_obs <- nrow(X_mat)
+  pred_prob <- numeric(n_obs)
+  
+  beta_tr <- betah2[, , tr_select, , drop = FALSE]  # [Nmc, p, 1, Hdp]
+  
+  # Handle Parametric BP (H = 1) vs Nonparametric BNP (H > 1) mixture weights
+  if (Hdp == 1) {
+    w_tr <- matrix(1, nrow = Nmc, ncol = 1)
+  } else {
+    w_tr <- wh2[, , tr_select]                        # [Nmc, Hdp]
+  }
+  
+  sig_tr <- sqrt(sig2[, tr_select])                   # [Nmc]
+  
+  for (i in 1:n_obs) {
+    x_i  <- X_mat[i, ]
+    hp_i <- hp_vec[i]
+    bk_i <- bk2[, hp_i] 
+    
+    mc_cdf <- numeric(Nmc)
+    for (jdp in 1:Hdp) {
+      beta_jdp <- beta_tr[, , 1, jdp]
+      
+      mean_log_j <- as.numeric(beta_jdp %*% x_i) + bk_i
+      weight_j   <- w_tr[, jdp]
+      
+      mc_cdf <- mc_cdf + weight_j * plnorm(y_eval, meanlog = mean_log_j, sdlog = sig_tr)
+    }
+    pred_prob[i] <- mean(mc_cdf)
+  }
+  return(pred_prob)
+}
+
+# Predicted Survival Function Extractor: S_hat(t) = 1 - CDF(t)
+get_pred_surv_all <- function(time_eval_val) {
+  lapply(1:9, function(j) {
+    data_j <- res2.na.test[res2.na.test\$trans2 == j, ]
+    if (nrow(data_j) == 0) return(numeric(0))
+    
+    X_j <- model.matrix(~ AGE + LN_O + bs(Size, df = 3) + as.factor(Grade) + ER.status, 
+                        data = data_j)
+    
+    cdf_val <- calc_pred_cdf(y_eval = time_eval_val, X_mat = X_j, tr_select = j, hp_vec = data_j\$hospital)
+    return(1 - cdf_val) # Returns Survival S_hat(t)
+  })
+}
+
+# 4. IPCW Brier Score Function (Strictly Matching Manuscript Formulation) -----
+compute_ipcw_brier_trans <- function(tr_select, time_eval, test_data, pred_surv_list) {
+  
+  data_j <- test_data[test_data\$trans2 == tr_select, ]
+  S_pred <- pred_surv_list[[tr_select]]  # S_hat(t | x_i)
+  N_j    <- nrow(data_j)
+  
+  if (N_j == 0 || length(S_pred) == 0) return(NA)
+  
+  times  <- data_j\$time
+  status <- data_j\$status
+  
+  # Per-transition censoring distribution via Kaplan-Meier
+  km_cens <- survfit(Surv(time, status == 0) ~ 1, data = data_j)
+  
+  get_G <- function(t_val) {
+    if (t_val <= 0) return(1)
+    g <- summary(km_cens, times = t_val)\$surv
+    if (length(g) == 0 || is.na(g) || g == 0) return(1e-4)
+    return(g)
+  }
+  
+  G_time_eval <- get_G(time_eval)
+  weighted_sq_errors <- numeric(N_j)
+  
+  # Graf et al. (1999) IPCW rule for Y_i(t) = I(T_i > t)
+  for (i in 1:N_j) {
+    t_i      <- times[i]
+    status_i <- status[i]
+    
+    if (t_i > time_eval) {
+      Y_obs_surv <- 1  # Subject alive / event-free at time_eval
+      w_i        <- 1 / G_time_eval
+    } else if (t_i <= time_eval && status_i == 1) {
+      Y_obs_surv <- 0  # Event observed prior to time_eval
+      w_i        <- 1 / get_G(t_i)
+    } else {
+      # Subject censored before time_eval: zero weight
+      Y_obs_surv <- 0
+      w_i        <- 0
+    }
+    
+    weighted_sq_errors[i] <- w_i * (S_pred[i] - Y_obs_surv)^2
+  }
+  
+  # Exact average over N_j (Manuscript Eq: 1/n * sum(w_i * (S_hat - Y)^2))
+  return(sum(weighted_sq_errors) / N_j)
+}
+
+# 5. Consolidated Evaluation at 5 and 10 Years (BNP & BP) ----------------------
+
+# --- Obtain Predicted Survival S(t) ---
+pred_surv_5yr  <- get_pred_surv_all(5)
+pred_surv_10yr <- get_pred_surv_all(10)
+
+# --- Compute IPCW Brier Score ---
+brier_5yr <- sapply(1:9, function(j) {
+  compute_ipcw_brier_trans(j, time_eval = 5, test_data = res2.na.test, pred_surv_list = pred_surv_5yr)
+})
+
+brier_10yr <- sapply(1:9, function(j) {
+  compute_ipcw_brier_trans(j, time_eval = 10, test_data = res2.na.test, pred_surv_list = pred_surv_10yr)
+})
+
+# Summary Table of Results
+res_brier_table <- data.frame(
+  Transition    = paste0("T", 1:9),
+  Brier_5Years  = round(brier_5yr, 4),
+  Brier_10Years = round(brier_10yr, 4)
+)
+
+print(res_brier_table)
+cat("\nOverall Brier Score (5 Years):", round(mean(brier_5yr, na.rm = TRUE), 4))
+cat("\nOverall Brier Score (10 Years):", round(mean(brier_10yr, na.rm = TRUE), 4))
