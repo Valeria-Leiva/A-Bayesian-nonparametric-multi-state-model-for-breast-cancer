@@ -1,1 +1,379 @@
 
+# ==============================================================================
+# CLOCK-RESET COX MODEL: DATA PROCESSING, EVALUATION & CALIBRATION (5 & 10 YRS)
+# METABRIC Cohort Multi-State Survival Analysis
+# ==============================================================================
+# Note: The data splits (e.g., Split6) are identical to those used in the C-index 
+# evaluation. To change the fold/split, simply update the working directory/path.
+# ==============================================================================
+
+# Clear workspace
+rm(list = ls())
+
+# Set your local working directory
+# setwd("path/to/your/BNP_article")
+
+# Required Libraries -----------------------------------------------------------
+library(survival)
+library(ggplot2)
+library(splines)
+library(mstate)
+library(dplyr)
+library(tidyverse)
+library(patchwork)
+
+# 1. Data Loading and Preprocessing --------------------------------------------
+Clinical <- read.table("TableS5.txt", header = TRUE, sep = "\t", quote = "", 
+                       comment.char = "", stringsAsFactors = FALSE)
+Clinical$NaturalDeath <- 1 * (Clinical$Last.Followup.Status %in% c("d", "d-o.c."))
+
+# Exclude sample cases without follow-up or in Stage 4
+ids <- which(Clinical$T == 0)
+if (length(ids) > 0) Clinical <- Clinical[-ids, ]
+Clinical <- Clinical[-which(Clinical$Stage == 4), ]
+Clinical <- Clinical[which(!is.na(Clinical$T)), ]
+Clinical <- Clinical[which(!is.na(Clinical$Death)), ]
+
+bad.hist <- which(Clinical$Histological.Type %in% c("BENIGN", "PHYL"))
+if (length(bad.hist) > 0) Clinical <- Clinical[-bad.hist, ]
+
+# Apply minor perturbations to break tied event times
+Clinical$TLR[which(Clinical$TLR == 0)] <- 0.1
+Clinical$TDR[which(Clinical$TDR == 0)] <- 0.1
+Clinical$T[which(Clinical$T == Clinical$TDR & Clinical$DR == 1)] <- Clinical$T[which(Clinical$T == Clinical$TDR & Clinical$DR == 1)] + 0.1
+Clinical$T[which(Clinical$T == Clinical$TLR & Clinical$LR == 1)] <- Clinical$T[which(Clinical$T == Clinical$TLR & Clinical$LR == 1)] + 0.1
+Clinical$TDR[which(Clinical$TLR == Clinical$TDR & Clinical$LR == 1 & Clinical$DR == 1)] <- Clinical$TDR[which(Clinical$TLR == Clinical$TDR & Clinical$LR == 1 & Clinical$DR == 1)] + 0.1
+
+Clinical$TLR[which(Clinical$LR == 0)] <- Clinical$T[which(Clinical$LR == 0)]
+Clinical$TDR[which(Clinical$DR == 0)] <- Clinical$T[which(Clinical$DR == 0)]
+
+Clinical$LR[which(Clinical$TLR > Clinical$TDR)] <- 0
+Clinical$TLR[which(Clinical$TLR > Clinical$TDR)] <- Clinical$T[which(Clinical$TLR > Clinical$TDR)]
+
+# Convert follow-up times to years
+Clinical$T   <- Clinical$T / 365.25
+Clinical$TLR <- Clinical$TLR / 365.25
+Clinical$TDR <- Clinical$TDR / 365.25
+
+Clinical$LN    <- Clinical$Lymph.Nodes.Positive
+Clinical$LN[which(Clinical$LN >= 10)] <- 10
+Clinical$AGE   <- Clinical$Age.At.Diagnosis
+Clinical$GRADE <- as.numeric(as.character(Clinical$Grade))
+Clinical$SIZE  <- as.numeric(as.character(Clinical$Size))
+Clinical$BS    <- factor(Clinical$Breast.Surgery, levels = c("BREAST CONSERVING", "MASTECTOMY"), labels = c("BC", "M"))
+Clinical$ER.Status <- factor(Clinical$ER.Status, levels = c("neg", "pos"), labels = c("ER-", "ER+"))
+
+# Transition Matrix Construction (10 states: 5 for ER- and 5 for ER+)
+tra <- matrix(NA, 5 * 2, 5 * 2)
+state.names <- paste(c("PostSurgery", "LocalRelapse", "DistantRelapse", "CancerDeath", "NaturalDeath"),
+                     rep(levels(Clinical$ER.Status), rep(5, 2)), sep = "_")
+rownames(tra) <- state.names
+colnames(tra) <- rownames(tra)
+
+counter <- 1
+for (i in seq(from = 1, by = 5, length = 2)) {
+  tra[i, (i + 1):(i + 4)] <- counter:(counter + 3)
+  counter <- counter + 4
+  tra[i + 1, (i + 2):(i + 4)] <- counter:(counter + 2)
+  counter <- counter + 3
+  tra[i + 2, (i + 3):(i + 4)] <- counter:(counter + 1)
+  counter <- counter + 2
+}
+
+ALL.CLINICAL <- Clinical
+
+# Build long-format multi-state data structure (msdata)
+set.seed(12324)
+all.X <- list()
+for (ic in levels(ALL.CLINICAL$ER.Status)) {
+  Clinical_sub <- ALL.CLINICAL[which(ALL.CLINICAL$ER.Status == ic), ]
+  X <- NULL
+  for (i in 1:nrow(Clinical_sub)) {
+    # 1. Surgery -> Local
+    tmp <- data.frame(id = Clinical_sub$METABRIC.ID[i], from = 1, to = 2, trans = 1,
+                      Tstart = 0, Tstop = min(Clinical_sub$TLR[i], Clinical_sub$TDR[i]),
+                      status = Clinical_sub$LR[i], LN = Clinical_sub$LN[i], AGE = Clinical_sub$AGE[i],
+                      GRADE = Clinical_sub$GRADE[i], SIZE = Clinical_sub$SIZE[i], BS = Clinical_sub$BS[i],
+                      ER = Clinical_sub$ER.Status[i], TLastSurgery = 0, TLastLocal = 0)
+    X <- rbind(X, tmp)
+    
+    # 2. Surgery -> Distant
+    tmp <- data.frame(id = Clinical_sub$METABRIC.ID[i], from = 1, to = 3, trans = 2,
+                      Tstart = 0, Tstop = min(Clinical_sub$TLR[i], Clinical_sub$TDR[i]),
+                      status = 1 * (Clinical_sub$LR[i] == 0) * Clinical_sub$DR[i], LN = Clinical_sub$LN[i],
+                      AGE = Clinical_sub$AGE[i], GRADE = Clinical_sub$GRADE[i], SIZE = Clinical_sub$SIZE[i],
+                      BS = Clinical_sub$BS[i], ER = Clinical_sub$ER.Status[i], TLastSurgery = 0, TLastLocal = 0)
+    X <- rbind(X, tmp)
+    
+    # 3. Surgery -> Cancer Death
+    tmp <- data.frame(id = Clinical_sub$METABRIC.ID[i], from = 1, to = 4, trans = 3,
+                      Tstart = 0, Tstop = min(Clinical_sub$TLR[i], Clinical_sub$TDR[i]),
+                      status = 1 * (Clinical_sub$LR[i] == 0 & Clinical_sub$DR[i] == 0) * Clinical_sub$DeathBreast[i],
+                      LN = Clinical_sub$LN[i], AGE = Clinical_sub$AGE[i], GRADE = Clinical_sub$GRADE[i],
+                      SIZE = Clinical_sub$SIZE[i], BS = Clinical_sub$BS[i], ER = Clinical_sub$ER.Status[i],
+                      TLastSurgery = 0, TLastLocal = 0)
+    X <- rbind(X, tmp)
+    
+    # 4. Surgery -> Natural Death
+    tmp <- data.frame(id = Clinical_sub$METABRIC.ID[i], from = 1, to = 5, trans = 4,
+                      Tstart = 0, Tstop = min(Clinical_sub$TLR[i], Clinical_sub$TDR[i]),
+                      status = 1 * (Clinical_sub$LR[i] == 0 & Clinical_sub$DR[i] == 0) * Clinical_sub$NaturalDeath[i],
+                      LN = Clinical_sub$LN[i], AGE = Clinical_sub$AGE[i], GRADE = Clinical_sub$GRADE[i],
+                      SIZE = Clinical_sub$SIZE[i], BS = Clinical_sub$BS[i], ER = Clinical_sub$ER.Status[i],
+                      TLastSurgery = 0, TLastLocal = 0)
+    X <- rbind(X, tmp)
+    
+    # Local Relapses
+    if (Clinical_sub$LR[i] == 1) {
+      tmp <- data.frame(id = Clinical_sub$METABRIC.ID[i], from = 2, to = 3, trans = 5,
+                        Tstart = Clinical_sub$TLR[i], Tstop = min(Clinical_sub$TDR[i], Clinical_sub$T[i]),
+                        status = Clinical_sub$DR[i], LN = Clinical_sub$LN[i], AGE = Clinical_sub$AGE[i] + Clinical_sub$TLR[i],
+                        GRADE = Clinical_sub$GRADE[i], SIZE = Clinical_sub$SIZE[i], BS = Clinical_sub$BS[i],
+                        ER = Clinical_sub$ER.Status[i], TLastSurgery = Clinical_sub$TLR[i], TLastLocal = 0)
+      X <- rbind(X, tmp)
+      
+      tmp <- data.frame(id = Clinical_sub$METABRIC.ID[i], from = 2, to = 4, trans = 6,
+                        Tstart = Clinical_sub$TLR[i], Tstop = min(Clinical_sub$TDR[i], Clinical_sub$T[i]),
+                        status = 1 * (Clinical_sub$DR[i] == 0) * Clinical_sub$DeathBreast[i], LN = Clinical_sub$LN[i],
+                        AGE = Clinical_sub$AGE[i] + Clinical_sub$TLR[i], GRADE = Clinical_sub$GRADE[i],
+                        SIZE = Clinical_sub$SIZE[i], BS = Clinical_sub$BS[i], ER = Clinical_sub$ER.Status[i],
+                        TLastSurgery = Clinical_sub$TLR[i], TLastLocal = 0)
+      X <- rbind(X, tmp)
+      
+      tmp <- data.frame(id = Clinical_sub$METABRIC.ID[i], from = 2, to = 5, trans = 7,
+                        Tstart = Clinical_sub$TLR[i], Tstop = min(Clinical_sub$TDR[i], Clinical_sub$T[i]),
+                        status = 1 * (Clinical_sub$DR[i] == 0) * Clinical_sub$NaturalDeath[i], LN = Clinical_sub$LN[i],
+                        AGE = Clinical_sub$AGE[i] + Clinical_sub$TLR[i], GRADE = Clinical_sub$GRADE[i],
+                        SIZE = Clinical_sub$SIZE[i], BS = Clinical_sub$BS[i], ER = Clinical_sub$ER.Status[i],
+                        TLastSurgery = 0, TLastLocal = 0)
+      X <- rbind(X, tmp)
+    }
+    
+    # Distant Relapses
+    if (Clinical_sub$DR[i] == 1) {
+      TLastSurgery <- if (Clinical_sub$LR[i] == 1) Clinical_sub$TDR[i] else Clinical_sub$TDR[i]
+      TLastLocal   <- if (Clinical_sub$LR[i] == 1) Clinical_sub$TDR[i] - Clinical_sub$TLR[i] else 0
+      
+      tmp <- data.frame(id = Clinical_sub$METABRIC.ID[i], from = 3, to = 4, trans = 8,
+                        Tstart = Clinical_sub$TDR[i], Tstop = Clinical_sub$T[i], status = Clinical_sub$DeathBreast[i],
+                        LN = Clinical_sub$LN[i], AGE = Clinical_sub$AGE[i] + Clinical_sub$TDR[i], GRADE = Clinical_sub$GRADE[i],
+                        SIZE = Clinical_sub$SIZE[i], BS = Clinical_sub$BS[i], ER = Clinical_sub$ER.Status[i],
+                        TLastSurgery = TLastSurgery, TLastLocal = TLastLocal)
+      X <- rbind(X, tmp)
+      
+      tmp <- data.frame(id = Clinical_sub$METABRIC.ID[i], from = 3, to = 5, trans = 9,
+                        Tstart = Clinical_sub$TDR[i], Tstop = Clinical_sub$T[i], status = Clinical_sub$NaturalDeath[i],
+                        LN = Clinical_sub$LN[i], AGE = Clinical_sub$AGE[i] + Clinical_sub$TDR[i], GRADE = Clinical_sub$GRADE[i],
+                        SIZE = Clinical_sub$SIZE[i], BS = Clinical_sub$BS[i], ER = Clinical_sub$ER.Status[i],
+                        TLastSurgery = 0, TLastLocal = 0)
+      X <- rbind(X, tmp)
+    }
+  }
+  all.X[[ic]] <- X
+}
+
+res <- all.X
+for (i in 1:length(res)) {
+  res[[i]]$from  <- res[[i]]$from + 5 * (i - 1)
+  res[[i]]$to    <- res[[i]]$to + 5 * (i - 1)
+  res[[i]]$trans <- res[[i]]$trans + 9 * (i - 1)
+}
+res <- do.call("rbind", res)
+res$time <- res$Tstop - res$Tstart
+
+nat.death <- as.numeric((tra[, grep("NaturalDeath", colnames(tra))]))
+nat.death <- unique(na.omit(nat.death))
+res$AGE[which(!res$trans %in% nat.death)]   <- 0
+res$GRADE[which(res$trans %in% nat.death)] <- 0
+res$SIZE[which(res$trans %in% nat.death)]  <- 0
+res$LN[which(res$trans %in% nat.death)]    <- 0
+
+# Covariate Interaction Terms --------------------------------------------------
+res$AGE.NEG <- res$AGE * (res$ER == "ER-")
+res$AGE.POS <- res$AGE * (res$ER == "ER+")
+res$GRADE.NEG <- res$GRADE * (res$ER == "ER-")
+res$GRADE.POS <- res$GRADE * (res$ER == "ER+")
+res$SIZE.NEG <- res$SIZE * (res$ER == "ER-")
+res$SIZE.POS <- res$SIZE * (res$ER == "ER+")
+res$LN.NEG <- res$LN * (res$ER == "ER-")
+res$LN.POS <- res$LN * (res$ER == "ER+")
+res$TLastSurgery.NEG <- res$TLastSurgery * (res$ER == "ER-")
+res$TLastSurgery.POS <- res$TLastSurgery * (res$ER == "ER+")
+res$TLastLocal.DR.NEG <- res$TLastLocal * (res$ER == "ER-")
+res$TLastLocal.DR.POS <- res$TLastLocal * (res$ER == "ER+")
+
+res$AGE.PS.NEG <- res$AGE.NEG * (res$from %in% grep("PostSurgery", colnames(tra)))
+res$AGE.PS.POS <- res$AGE.POS * (res$from %in% grep("PostSurgery", colnames(tra)))
+res$AGE.LR.NEG <- res$AGE.NEG * (res$from %in% grep("LocalRelapse", colnames(tra)))
+res$AGE.LR.POS <- res$AGE.POS * (res$from %in% grep("LocalRelapse", colnames(tra)))
+res$AGE.DR.NEG <- res$AGE.NEG * (res$from %in% grep("DistantRelapse", colnames(tra)))
+res$AGE.DR.POS <- res$AGE.POS * (res$from %in% grep("DistantRelapse", colnames(tra)))
+
+res$GRADE.PS.NEG <- res$GRADE.NEG * (res$from %in% grep("PostSurgery", colnames(tra)))
+res$GRADE.PS.POS <- res$GRADE.POS * (res$from %in% grep("PostSurgery", colnames(tra)))
+res$GRADE.LR.NEG <- res$GRADE.NEG * (res$from %in% grep("LocalRelapse", colnames(tra)))
+res$GRADE.LR.POS <- res$GRADE.POS * (res$from %in% grep("LocalRelapse", colnames(tra)))
+res$GRADE.DR.NEG <- res$GRADE.NEG * (res$from %in% grep("DistantRelapse", colnames(tra)))
+res$GRADE.DR.POS <- res$GRADE.POS * (res$from %in% grep("DistantRelapse", colnames(tra)))
+
+res$SIZE.PS.NEG <- res$SIZE.NEG * (res$from %in% grep("PostSurgery", colnames(tra)))
+res$SIZE.PS.POS <- res$SIZE.POS * (res$from %in% grep("PostSurgery", colnames(tra)))
+res$SIZE.LR.NEG <- res$SIZE.NEG * (res$from %in% grep("LocalRelapse", colnames(tra)))
+res$SIZE.LR.POS <- res$SIZE.POS * (res$from %in% grep("LocalRelapse", colnames(tra)))
+res$SIZE.DR.NEG <- res$SIZE.NEG * (res$from %in% grep("DistantRelapse", colnames(tra)))
+res$SIZE.DR.POS <- res$SIZE.POS * (res$from %in% grep("DistantRelapse", colnames(tra)))
+
+res$LN.PS.NEG <- res$LN.NEG * (res$from %in% grep("PostSurgery", colnames(tra)))
+res$LN.PS.POS <- res$LN.POS * (res$from %in% grep("PostSurgery", colnames(tra)))
+res$LN.LR.NEG <- res$LN.NEG * (res$from %in% grep("LocalRelapse", colnames(tra)))
+res$LN.LR.POS <- res$LN.POS * (res$from %in% grep("LocalRelapse", colnames(tra)))
+res$LN.DR.NEG <- res$LN.NEG * (res$from %in% grep("DistantRelapse", colnames(tra)))
+res$LN.DR.POS <- res$LN.POS * (res$from %in% grep("DistantRelapse", colnames(tra)))
+
+res$TLastSurgery.LR.NEG <- res$TLastSurgery.NEG * (res$from %in% grep("LocalRelapse", colnames(tra)))
+res$TLastSurgery.LR.POS <- res$TLastSurgery.POS * (res$from %in% grep("LocalRelapse", colnames(tra)))
+res$TLastSurgery.DR.NEG <- res$TLastSurgery.NEG * (res$from %in% grep("DistantRelapse", colnames(tra)))
+res$TLastSurgery.DR.POS <- res$TLastSurgery.POS * (res$from %in% grep("DistantRelapse", colnames(tra)))
+
+# 2. Train / Test Partition Selection -----------------------------------------
+# Note: Update folder location (Split1, Split2, etc.) to evaluate different folds.
+load("Split6/id_res_up.RData")
+
+res.train <- res %>% filter(id %in% id_res_up$id.train)
+res.test  <- res %>% filter(id %in% id_res_up$id.test)
+
+
+# ==============================================================================
+# CLOCK-RESET COX MODEL: MODEL FIT & STANDARDIZED IPCW BRIER SCORE EVALUATION
+# ==============================================================================
+
+# 1. Fit Stratified Semi-Parametric Cox Model (Clock-Reset) --------------------
+fm_train <- coxph(
+  Surv(time, status) ~ strata(trans) + 
+    AGE.PS.NEG + AGE.LR.NEG + AGE.DR.NEG + AGE.PS.POS + AGE.LR.POS + AGE.DR.POS + 
+    GRADE.PS.NEG + GRADE.LR.NEG + GRADE.DR.NEG + GRADE.PS.POS + GRADE.LR.POS + GRADE.DR.POS + 
+    SIZE.PS.NEG + SIZE.LR.NEG + SIZE.DR.NEG + SIZE.PS.POS + SIZE.LR.POS + SIZE.DR.POS + 
+    LN.PS.NEG + LN.LR.NEG + LN.DR.NEG + LN.PS.POS + LN.LR.POS + LN.DR.POS + 
+    TLastSurgery.LR.NEG + TLastSurgery.DR.NEG + TLastSurgery.LR.POS + TLastSurgery.DR.POS + 
+    TLastLocal.DR.NEG + TLastLocal.DR.POS + cluster(id), 
+  data = res.train
+)
+
+# Extract Baseline Cumulative Hazards Lambda_0,j(t)
+base_haz <- basehaz(fm_train, centered = FALSE)
+base_haz$trans_num <- as.numeric(gsub("trans=", "", as.character(base_haz$strata)))
+num_trans_total <- max(base_haz$trans_num, na.rm = TRUE)
+
+# 2. Predicted Cumulative Distribution Function Extractor: F_j(t | x_i) --------
+get_cox_pred_cdf <- function(model, base_haz_df, test_data, time_eval) {
+  pred_list <- vector("list", num_trans_total)
+  
+  for (j in 1:num_trans_total) {
+    data_j <- test_data %>% filter(trans == j)
+    N_j    <- nrow(data_j)
+    
+    if (N_j == 0) {
+      pred_list[[j]] <- numeric(0)
+      next
+    }
+    
+    # Linear predictor
+    lp_scores <- tryCatch(
+      predict(model, newdata = data_j, type = "lp"),
+      error = function(e) rep(0, N_j)
+    )
+    lp_scores[is.na(lp_scores)] <- 0
+    risk_scores <- exp(lp_scores)
+    
+    # Retrieve Lambda_0,j(time_eval)
+    haz_j <- base_haz_df %>% filter(trans_num == j, time <= time_eval)
+    
+    if (nrow(haz_j) == 0) {
+      cum_haz_base <- 0
+    } else {
+      cum_haz_base <- haz_j$hazard[which.max(haz_j$time)]
+    }
+    
+    # Predicted CDF: P(T <= time_eval) = 1 - exp(- Lambda_0,j(t) * exp(lp_i))
+    surv_prob <- exp(- cum_haz_base * risk_scores)
+    cdf_prob  <- 1 - surv_prob
+    cdf_prob[is.na(cdf_prob)] <- 1
+    
+    pred_list[[j]] <- cdf_prob
+  }
+  
+  return(pred_list)
+}
+
+# 3. IPCW Brier Score Function (Harmonized with BNP Pipeline) -----------------
+compute_ipcw_brier_trans_cox <- function(tr_select, time_eval, test_data, pred_cdf_list) {
+  
+  data_j <- test_data %>% filter(trans == tr_select)
+  pred_j <- pred_cdf_list[[tr_select]]
+  
+  if (nrow(data_j) == 0 || length(pred_j) == 0) return(NA)
+  
+  times  <- data_j$time
+  status <- data_j$status
+  
+  # Kaplan-Meier Censoring Distribution per Transition
+  km_cens <- survfit(Surv(time, status == 0) ~ 1, data = data_j)
+  
+  get_G <- function(t_val) {
+    if (t_val <= 0) return(1)
+    g <- summary(km_cens, times = t_val)$surv
+    if (length(g) == 0 || is.na(g) || g == 0) return(1e-4)
+    return(g)
+  }
+  
+  G_time_eval <- get_G(time_eval)
+  
+  weights     <- numeric(length(times))
+  include_obs <- logical(length(times))
+  Y_obs       <- numeric(length(times))
+  
+  for (i in 1:length(times)) {
+    if (times[i] <= time_eval && status[i] == 1) {
+      Y_obs[i]       <- 1
+      weights[i]     <- 1 / get_G(times[i])
+      include_obs[i] <- TRUE
+    } else if (times[i] > time_eval) {
+      Y_obs[i]       <- 0
+      weights[i]     <- 1 / G_time_eval
+      include_obs[i] <- TRUE
+    } else {
+      include_obs[i] <- FALSE
+    }
+  }
+  
+  if (sum(include_obs) == 0) return(NA)
+  
+  squared_errors <- (pred_j[include_obs] - Y_obs[include_obs])^2
+  w_included     <- weights[include_obs]
+  
+  # IPCW weighted Brier Score calculation (Graf et al. 1999 / Gerds & Schumacher 2006)
+  return(sum(w_included * squared_errors) / sum(w_included))
+}
+
+# 4. Consolidated Evaluation at 5 and 10 Years ---------------------------------
+pred_Cox_5yr  <- get_cox_pred_cdf(fm_train, base_haz, res.test, time_eval = 5)
+pred_Cox_10yr <- get_cox_pred_cdf(fm_train, base_haz, res.test, time_eval = 10)
+
+brier_cox_5yr <- sapply(1:num_trans_total, function(j) {
+  compute_ipcw_brier_trans_cox(j, time_eval = 5, test_data = res.test, pred_cdf_list = pred_Cox_5yr)
+})
+
+brier_cox_10yr <- sapply(1:num_trans_total, function(j) {
+  compute_ipcw_brier_trans_cox(j, time_eval = 10, test_data = res.test, pred_cdf_list = pred_Cox_10yr)
+})
+
+# Summary Results Table
+res_brier_cox_table <- data.frame(
+  Transition    = paste0("T", 1:num_trans_total),
+  Brier_5Years  = round(brier_cox_5yr, 4),
+  Brier_10Years = round(brier_cox_10yr, 4)
+)
+
+print(res_brier_cox_table)
+cat("\nOverall Cox Brier Score (5 Years):", round(mean(brier_cox_5yr, na.rm = TRUE), 4))
+cat("\nOverall Cox Brier Score (10 Years):", round(mean(brier_cox_10yr, na.rm = TRUE), 4))
